@@ -1,4 +1,5 @@
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 
-from fsdownload.models.time_xer import TimeXerForecaster
+from fsdownload.models.time_xer import TimeXerForecaster, model_config_from_args
 from fsdownload.utils.data_loader import (
     ARTIFACTS_DIR,
     INPUT_DIM_PARAM,
@@ -80,18 +81,13 @@ def suggest_adjustment(args):
     scaler_param = load_pickle(scaler_param_path)
     scaler_delta = load_pickle(scaler_delta_path)
 
-    model = TimeXerForecaster(
-        input_dim_temp=INPUT_DIM_TEMP,
-        input_dim_param=INPUT_DIM_PARAM,
-        pred_steps=args.pred_steps,
-        patch_len=args.patch_len,
-        stride=args.stride,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        d_ff=args.d_ff,
-    ).to(device)
+    model_config_path = Path(args.model_config_path)
+    if model_config_path.exists():
+        model_config = json.loads(model_config_path.read_text())
+    else:
+        model_config = model_config_from_args(args)
+
+    model = TimeXerForecaster(**model_config).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
 
     runtime_data_path = resolve_runtime_data_path(raw_data_dir=args.raw_data_dir, today_path=args.today_path)
@@ -122,6 +118,8 @@ def suggest_adjustment(args):
 
     delta_scale = torch.tensor(scaler_delta.scale_, dtype=torch.float32, device=device)
     delta_mean = torch.tensor(scaler_delta.mean_, dtype=torch.float32, device=device)
+    param_scale = torch.tensor(scaler_param.scale_, dtype=torch.float32, device=device)
+    param_mean = torch.tensor(scaler_param.mean_, dtype=torch.float32, device=device)
 
     optimizer = Adam([param_tensor], lr=args.optim_lr)
     loss_fn = nn.SmoothL1Loss()
@@ -132,12 +130,25 @@ def suggest_adjustment(args):
 
     for _ in range(args.optim_steps):
         optimizer.zero_grad()
-        predicted_delta = model(temp_tensor, param_tensor.unsqueeze(0))[0]
+        predicted_delta, predicted_logvar = model.predict_distribution(temp_tensor, param_tensor.unsqueeze(0))
+        predicted_delta = predicted_delta[0]
+        predicted_logvar = predicted_logvar[0]
         predicted_temp = current_temp_tensor.unsqueeze(0) + predicted_delta * delta_scale + delta_mean
+        predicted_std = torch.exp(0.5 * predicted_logvar) * delta_scale.unsqueeze(0)
 
         temp_loss = loss_fn(predicted_temp[-args.mean_window:].mean(dim=0)[mask], target_temp_tensor[mask])
+        risk_loss = predicted_std[-args.mean_window:].mean(dim=0)[mask].mean()
         reg_loss = torch.mean((param_tensor - original_param_tensor) ** 2)
-        loss = temp_loss + args.regularization_weight * reg_loss
+        param_real = param_tensor * param_scale + param_mean
+        current_param_real = original_param_tensor * param_scale + param_mean
+        delta_real = torch.abs(param_real - current_param_real)
+        bound_penalty = torch.relu(delta_real - args.max_param_change).pow(2).mean()
+        loss = (
+            temp_loss
+            + args.risk_weight * risk_loss
+            + args.regularization_weight * reg_loss
+            + args.bound_penalty_weight * bound_penalty
+        )
         loss.backward()
         optimizer.step()
 
@@ -152,13 +163,13 @@ def suggest_adjustment(args):
     write_pipe_values(suggestion, args.output_path)
     append_suggestion_log(suggestion, args.output_log_path)
 
-    print("Suggested parameter updates:")
+    print("Suggested combustion updates:")
     for index, (old_value, new_value) in enumerate(zip(current_params, suggestion), start=1):
         print(f"param_{index:02d}: {new_value - old_value:+.2f} ({old_value:.2f} -> {new_value:.2f})")
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Optimize control parameters with the trained TimeXer model.")
+    parser = argparse.ArgumentParser(description="Optimize combustion settings with the trained TimeXer model.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
 
@@ -169,6 +180,9 @@ def build_parser():
     parser.add_argument("--optim_steps", type=int, default=300)
     parser.add_argument("--optim_lr", type=float, default=0.02)
     parser.add_argument("--regularization_weight", type=float, default=0.0)
+    parser.add_argument("--risk_weight", type=float, default=0.2)
+    parser.add_argument("--bound_penalty_weight", type=float, default=0.2)
+    parser.add_argument("--max_param_change", type=float, default=20.0)
 
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -177,10 +191,14 @@ def build_parser():
     parser.add_argument("--d_ff", type=int, default=256)
     parser.add_argument("--patch_len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--long_patch_len", type=int, default=32)
+    parser.add_argument("--long_stride", type=int, default=16)
+    parser.add_argument("--max_patches", type=int, default=256)
 
     parser.add_argument("--raw_data_dir", type=str, default=str(RAW_DATA_DIR))
     parser.add_argument("--today_path", type=str, default=None)
     parser.add_argument("--model_path", type=str, default=str(ARTIFACTS_DIR / "model.pth"))
+    parser.add_argument("--model_config_path", type=str, default=str(ARTIFACTS_DIR / "model_config.json"))
     parser.add_argument("--scaler_temp_path", type=str, default=str(ARTIFACTS_DIR / "scaler_temp.pkl"))
     parser.add_argument("--scaler_param_path", type=str, default=str(ARTIFACTS_DIR / "scaler_param.pkl"))
     parser.add_argument("--scaler_delta_path", type=str, default=str(ARTIFACTS_DIR / "scaler_delta.pkl"))

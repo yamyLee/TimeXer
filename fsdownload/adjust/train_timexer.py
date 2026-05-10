@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import matplotlib.pyplot as plt
 import torch
@@ -6,7 +7,7 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-from fsdownload.models.time_xer import TimeXerForecaster
+from fsdownload.models.time_xer import TimeXerForecaster, model_config_from_args
 from fsdownload.utils.data_loader import (
     ARTIFACTS_DIR,
     INPUT_DIM_PARAM,
@@ -33,6 +34,7 @@ def train_model(args):
     scaler_param_path = ensure_parent(args.scaler_param_path)
     scaler_delta_path = ensure_parent(args.scaler_delta_path)
     loss_plot_path = ensure_parent(args.loss_plot_path)
+    model_config_path = ensure_parent(args.model_config_path)
 
     training_matrix = load_training_matrix_from_raw(
         raw_data_dir=args.raw_data_dir,
@@ -83,21 +85,12 @@ def train_model(args):
     val_loader = DataLoader(TensorDataset(x_temp_val, x_param_val, y_val), batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(TensorDataset(x_temp_test, x_param_test, y_test), batch_size=args.batch_size, shuffle=False)
 
-    model = TimeXerForecaster(
-        input_dim_temp=args.input_dim_temp,
-        input_dim_param=args.input_dim_param,
-        pred_steps=args.pred_steps,
-        patch_len=args.patch_len,
-        stride=args.stride,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        d_ff=args.d_ff,
-    ).to(device)
+    model_config = model_config_from_args(args)
+    model = TimeXerForecaster(**model_config).to(device)
+    model_config_path.write_text(json.dumps(model_config, indent=2, sort_keys=True))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.l2_lambda)
-    loss_fn = nn.MSELoss()
+    mse_loss_fn = nn.MSELoss()
 
     best_val_loss = float("inf")
     train_losses = []
@@ -112,8 +105,10 @@ def train_model(args):
             noise_temp = torch.randn_like(x_temp_batch) * args.noise_level
             noise_param = torch.randn_like(x_param_batch) * args.noise_level
 
-            predictions = model(x_temp_batch + noise_temp, x_param_batch + noise_param)
-            loss = loss_fn(predictions, y_batch)
+            predictions, logvar = model.predict_distribution(x_temp_batch + noise_temp, x_param_batch + noise_param)
+            mse_loss = mse_loss_fn(predictions, y_batch)
+            nll_loss = 0.5 * torch.mean(torch.exp(-logvar) * (predictions - y_batch) ** 2 + logvar)
+            loss = mse_loss + args.uncertainty_weight * nll_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -127,8 +122,10 @@ def train_model(args):
         val_loss_sum = 0.0
         with torch.no_grad():
             for x_temp_batch, x_param_batch, y_batch in val_loader:
-                predictions = model(x_temp_batch, x_param_batch)
-                val_loss_sum += loss_fn(predictions, y_batch).item()
+                predictions, logvar = model.predict_distribution(x_temp_batch, x_param_batch)
+                mse_loss = mse_loss_fn(predictions, y_batch)
+                nll_loss = 0.5 * torch.mean(torch.exp(-logvar) * (predictions - y_batch) ** 2 + logvar)
+                val_loss_sum += (mse_loss + args.uncertainty_weight * nll_loss).item()
 
         val_loss = val_loss_sum / len(val_loader)
         val_losses.append(val_loss)
@@ -147,11 +144,16 @@ def train_model(args):
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     test_loss_sum = 0.0
+    test_mse_sum = 0.0
     with torch.no_grad():
         for x_temp_batch, x_param_batch, y_batch in test_loader:
-            predictions = model(x_temp_batch, x_param_batch)
-            test_loss_sum += loss_fn(predictions, y_batch).item()
+            predictions, logvar = model.predict_distribution(x_temp_batch, x_param_batch)
+            mse_loss = mse_loss_fn(predictions, y_batch)
+            nll_loss = 0.5 * torch.mean(torch.exp(-logvar) * (predictions - y_batch) ** 2 + logvar)
+            test_loss_sum += (mse_loss + args.uncertainty_weight * nll_loss).item()
+            test_mse_sum += mse_loss.item()
     print(f"Test Loss: {test_loss_sum / len(test_loader):.4f}")
+    print(f"Test MSE: {test_mse_sum / len(test_loader):.4f}")
 
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_losses) + 1), train_losses, label="Training Loss")
@@ -182,12 +184,16 @@ def build_parser():
     parser.add_argument("--d_ff", type=int, default=256)
     parser.add_argument("--patch_len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--long_patch_len", type=int, default=32)
+    parser.add_argument("--long_stride", type=int, default=16)
+    parser.add_argument("--max_patches", type=int, default=256)
 
     parser.add_argument("--raw_data_dir", type=str, default=str(RAW_DATA_DIR))
     parser.add_argument("--date_from", type=str, default=None)
     parser.add_argument("--date_to", type=str, default=None)
     parser.add_argument("--raw_files", nargs="*", default=None)
     parser.add_argument("--model_path", type=str, default=str(ARTIFACTS_DIR / "model.pth"))
+    parser.add_argument("--model_config_path", type=str, default=str(ARTIFACTS_DIR / "model_config.json"))
     parser.add_argument("--scaler_temp_path", type=str, default=str(ARTIFACTS_DIR / "scaler_temp.pkl"))
     parser.add_argument("--scaler_param_path", type=str, default=str(ARTIFACTS_DIR / "scaler_param.pkl"))
     parser.add_argument("--scaler_delta_path", type=str, default=str(ARTIFACTS_DIR / "scaler_delta.pkl"))
@@ -199,6 +205,7 @@ def build_parser():
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--l2_lambda", type=float, default=1e-3)
     parser.add_argument("--noise_level", type=float, default=0.1)
+    parser.add_argument("--uncertainty_weight", type=float, default=0.2)
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     return parser
